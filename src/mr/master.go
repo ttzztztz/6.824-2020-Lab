@@ -1,39 +1,132 @@
 package mr
 
-import "log"
-import "net"
-import "os"
-import "net/rpc"
-import "net/http"
+import (
+	"fmt"
+	"log"
+	"net"
+	"net/http"
+	"net/rpc"
+	"os"
+	"sync"
+	"time"
+)
 
-
-type Master struct {
-	// Your definitions here.
-
+type CompleteChannelObject struct {
+	TaskType int
+	TaskData string
 }
 
-// Your code here -- RPC handlers for the worker to call.
+type Master struct {
+	MapTasksStatus    map[string]int
+	ReduceTasksStatus map[string]int
 
-//
-// an example RPC handler.
-//
-// the RPC argument and reply types are defined in rpc.go.
-//
-func (m *Master) Example(args *ExampleArgs, reply *ExampleReply) error {
-	reply.Y = args.X + 1
+	Files   []string
+	NReduce int
+
+	CompleteChannel chan CompleteChannelObject
+
+	mutex sync.Mutex
+}
+
+const TaskStatusStart = 0
+const TaskStatusDoing = 1
+const TaskStatusDone = 2
+
+func (m *Master) timeOutRemove(task string, taskType int) {
+	m.mutex.Lock()
+	defer m.mutex.Unlock()
+
+	if taskType == TaskTypeReduce {
+		m.ReduceTasksStatus[task] = TaskStatusStart
+	} else {
+		m.MapTasksStatus[task] = TaskStatusStart
+	}
+}
+
+func (m *Master) timeOutHandler(task string, taskType int) {
+	for {
+		select {
+		case complete := <-m.CompleteChannel:
+			if complete.TaskType == taskType && complete.TaskData == task {
+				return
+			}
+		case <-time.After(10 * time.Second):
+			m.timeOutRemove(task, taskType)
+			return
+		}
+	}
+}
+
+func (m *Master) unsafePickOneTask(list map[string]int) (bool, string) {
+	for k, v := range list {
+		if v == TaskStatusStart {
+			return true, k
+		}
+	}
+
+	return false, ""
+}
+
+func (m *Master) HandleTaskRequest(_ *TaskRequestArgs, reply *TaskRequestReply) error {
+	m.mutex.Lock()
+	defer m.mutex.Unlock()
+
+	if m.unsafeDone() {
+		reply.Type = TaskTypeFinished
+		reply.Data = ""
+		return nil
+	}
+
+	if success, data := m.unsafePickOneTask(m.MapTasksStatus); success {
+		reply.Type = TaskTypeMap
+		reply.Data = data
+		return nil
+	}
+
+	if success, data := m.unsafePickOneTask(m.ReduceTasksStatus); success {
+		reply.Type = TaskTypeReduce
+		reply.Data = data
+		return nil
+	}
+
+	reply.Type = TaskTypePending
+	reply.Data = ""
 	return nil
 }
 
+func (m *Master) HandleTaskComplete(args *TaskCompleteArgs, reply *TaskCompleteReply) error {
+	m.mutex.Lock()
+	defer m.mutex.Unlock()
+
+	reply.Ack = 1
+	if args.Type == TaskTypeReduce {
+		if m.ReduceTasksStatus[args.Data] != TaskStatusDoing {
+			return nil
+		}
+		m.ReduceTasksStatus[args.Data] = TaskStatusDone
+	} else if args.Type == TaskTypeMap {
+		if m.MapTasksStatus[args.Data] != TaskStatusDoing {
+			return nil
+		}
+		m.MapTasksStatus[args.Data] = TaskStatusDone
+	}
+
+	m.CompleteChannel <- CompleteChannelObject{
+		TaskType: args.Type,
+		TaskData: args.Data,
+	}
+
+	return nil
+}
 
 //
 // start a thread that listens for RPCs from worker.go
 //
 func (m *Master) server() {
-	rpc.Register(m)
+	_ = rpc.Register(m)
 	rpc.HandleHTTP()
-	//l, e := net.Listen("tcp", ":1234")
 	sockname := masterSock()
-	os.Remove(sockname)
+	_ = os.Remove(sockname)
 	l, e := net.Listen("unix", sockname)
 	if e != nil {
 		log.Fatal("listen error:", e)
@@ -46,12 +139,26 @@ func (m *Master) server() {
 // if the entire job has finished.
 //
 func (m *Master) Done() bool {
-	ret := false
+	m.mutex.Lock()
+	defer m.mutex.Unlock()
 
-	// Your code here.
+	return m.unsafeDone()
+}
 
+func (m *Master) unsafeDone() bool {
+	for _, v := range m.MapTasksStatus {
+		if v != TaskStatusDone {
+			return false
+		}
+	}
 
-	return ret
+	for _, v := range m.ReduceTasksStatus {
+		if v != TaskStatusDone {
+			return false
+		}
+	}
+
+	return true
 }
 
 //
@@ -60,10 +167,12 @@ func (m *Master) Done() bool {
 // nReduce is the number of reduce tasks to use.
 //
 func MakeMaster(files []string, nReduce int) *Master {
-	m := Master{}
+	m := Master{
+		Files:   files,
+		NReduce: nReduce,
+	}
 
-	// Your code here.
-
+	fmt.Println(files)
 
 	m.server()
 	return &m

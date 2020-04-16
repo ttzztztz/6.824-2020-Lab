@@ -1,10 +1,13 @@
 package mr
 
-import "fmt"
-import "log"
-import "net/rpc"
-import "hash/fnv"
-
+import (
+	"fmt"
+	"hash/fnv"
+	"log"
+	"net/rpc"
+	"os"
+	"time"
+)
 
 //
 // Map functions return a slice of KeyValue.
@@ -13,6 +16,9 @@ type KeyValue struct {
 	Key   string
 	Value string
 }
+
+type MapFunction = func(string, string) []KeyValue
+type ReduceFunction = func(string, []string) string
 
 //
 // use ihash(key) % NReduce to choose the reduce
@@ -24,41 +30,67 @@ func ihash(key string) int {
 	return int(h.Sum32() & 0x7fffffff)
 }
 
+func Map(mapf MapFunction, index int, data string) {
 
-//
-// main/mrworker.go calls this function.
-//
-func Worker(mapf func(string, string) []KeyValue,
-	reducef func(string, []string) string) {
+}
 
-	// Your worker implementation here.
-
-	// uncomment to send the Example RPC to the master.
-	// CallExample()
+func Reduce(reducef ReduceFunction) {
 
 }
 
 //
-// example function to show how to make an RPC call to the master.
+// main/mrworker.go calls this function.
 //
-// the RPC argument and reply types are defined in rpc.go.
-//
-func CallExample() {
+func Worker(mapf MapFunction,
+	reducef ReduceFunction) {
+	failTime := 0
+	for {
+		args := TaskRequestArgs{}
+		reply := TaskRequestReply{}
 
-	// declare an argument structure.
-	args := ExampleArgs{}
+		if call("Master.HandleTaskRequest", &args, &reply) {
+			failTime = 0
 
-	// fill in the argument(s).
-	args.X = 99
+			switch reply.Type {
+			case TaskTypeFinished:
+				{
+					fmt.Println("[Worker] Terminate after received finished request.")
+					os.Exit(0)
+				}
+			case TaskTypeMap:
+				{
 
-	// declare a reply structure.
-	reply := ExampleReply{}
+				}
+			case TaskTypeReduce:
+				{
 
-	// send the RPC request, wait for the reply.
-	call("Master.Example", &args, &reply)
+				}
+			case TaskTypePending:
+				{
+					// do nothing
+				}
+			}
 
-	// reply.Y should be 100.
-	fmt.Printf("reply.Y %v\n", reply.Y)
+		} else {
+			failTime++
+			fmt.Println("[Worker] Request Failed, Will retry after 1 seconds.")
+			if failTime >= 15 {
+				fmt.Println("[Worker] Error After tried 15 times to dial to master, got no response, will terminate.")
+				os.Exit(0)
+			}
+		}
+
+		time.Sleep(1 * time.Second)
+	}
+}
+
+func callComplete(data string, taskType int) {
+	args := TaskCompleteArgs{
+		Type: taskType,
+		Data: data,
+	}
+	reply := TaskCompleteReply{}
+	call("Master.HandleTaskComplete", &args, &reply)
 }
 
 //
