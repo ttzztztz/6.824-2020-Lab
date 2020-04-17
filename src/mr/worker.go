@@ -8,6 +8,7 @@ import (
 	"log"
 	"net/rpc"
 	"os"
+	"sort"
 	"time"
 )
 
@@ -21,6 +22,12 @@ type KeyValue struct {
 
 type MapFunction = func(string, string) []KeyValue
 type ReduceFunction = func(string, []string) string
+
+type ByKey []KeyValue
+
+func (a ByKey) Len() int           { return len(a) }
+func (a ByKey) Swap(i, j int)      { a[i], a[j] = a[j], a[i] }
+func (a ByKey) Less(i, j int) bool { return a[i].Key < a[j].Key }
 
 //
 // use ihash(key) % NReduce to choose the reduce
@@ -67,7 +74,7 @@ func Map(mapf MapFunction, mapIndex, nReduce int, fileName string) {
 			}
 			defer f.Close()
 
-			outputJson, err := json.Marshal(kva[i])
+			outputJson, err := json.Marshal(bucket[i])
 			if err != nil {
 				log.Fatalf("cannot parse json %v", outputFileName)
 			}
@@ -83,13 +90,14 @@ func Map(mapf MapFunction, mapIndex, nReduce int, fileName string) {
 }
 
 func Reduce(reducef ReduceFunction, nMap, reduceIndex int) {
-	outputFile := outputFileName(reduceIndex)
-	f, err := os.OpenFile(outputFile, os.O_RDWR|os.O_CREATE|os.O_TRUNC, 0755)
+	outputFileName := outputFileName(reduceIndex)
+	outputFile, err := os.OpenFile(outputFileName, os.O_RDWR|os.O_CREATE|os.O_TRUNC, 0755)
 	if err != nil {
-		log.Fatalf("cannot open %v", outputFile)
+		log.Fatalf("cannot open %v", outputFileName)
 	}
-	defer f.Close()
+	defer outputFile.Close()
 
+	kvMap := make(map[string][]string)
 	for i := 0; i < nMap; i++ {
 		tmpFile := mapFileName(i, reduceIndex)
 		func(fileName string) {
@@ -108,17 +116,32 @@ func Reduce(reducef ReduceFunction, nMap, reduceIndex int) {
 				log.Fatalf("cannot parse json %v", fileName)
 			}
 
-			kvMap := make(map[string][]string)
 			for _, val := range data {
 				kvMap[val.Key] = append(kvMap[val.Key], val.Value)
 			}
 
-			for k, v := range kvMap {
-				prod := reducef(k, v) // to be done
-				fmt.Fprintf(f, "%v %v\n", k, prod)
-			}
 		}(tmpFile)
 	}
+
+	finalOutput := make([]KeyValue, 0)
+
+	for k, v := range kvMap {
+		prod := reducef(k, v)
+
+		finalOutput = append(finalOutput, KeyValue{
+			Key:   k,
+			Value: prod,
+		})
+	}
+
+	sort.Sort(ByKey(finalOutput))
+	for _, val := range finalOutput {
+		k, v := val.Key, val.Value
+
+		fmt.Fprintf(outputFile, "%v %v\n", k, v)
+	}
+
+	callComplete(reduceIndex, TaskTypeReduce)
 }
 
 func Worker(mapf MapFunction, reducef ReduceFunction) {
@@ -133,7 +156,7 @@ func Worker(mapf MapFunction, reducef ReduceFunction) {
 			switch reply.Type {
 			case TaskTypeFinished:
 				{
-					fmt.Println("[Worker] Terminate after received finished request.")
+					log.Println("[Worker] Terminate after received finished request.")
 					return
 				}
 			case TaskTypeMap:
@@ -148,9 +171,9 @@ func Worker(mapf MapFunction, reducef ReduceFunction) {
 
 		} else {
 			failTime++
-			fmt.Println("[Worker] Request Failed, Will retry after 1 seconds.")
+			log.Println("[Worker] Request Failed, Will retry after 1 seconds.")
 			if failTime >= 15 {
-				fmt.Println("[Worker] Error After tried 15 times to dial to master, got no response, will terminate.")
+				log.Println("[Worker] Error After tried 15 times to dial to master, got no response, will terminate.")
 				os.Exit(0)
 			}
 		}
