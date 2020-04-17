@@ -1,8 +1,10 @@
 package mr
 
 import (
+	"encoding/json"
 	"fmt"
 	"hash/fnv"
+	"io/ioutil"
 	"log"
 	"net/rpc"
 	"os"
@@ -30,19 +32,96 @@ func ihash(key string) int {
 	return int(h.Sum32() & 0x7fffffff)
 }
 
-func Map(mapf MapFunction, index int, data string) {
-
+func mapFileName(mapIndex, reduceIndex int) string {
+	return fmt.Sprintf("mr-%d-%d.temp", mapIndex, reduceIndex)
 }
 
-func Reduce(reducef ReduceFunction) {
-
+func outputFileName(reduceIndex int) string {
+	return fmt.Sprintf("mr-out-%d", reduceIndex)
 }
 
-//
-// main/mrworker.go calls this function.
-//
-func Worker(mapf MapFunction,
-	reducef ReduceFunction) {
+func Map(mapf MapFunction, mapIndex, nReduce int, fileName string) {
+	file, err := os.Open(fileName)
+	if err != nil {
+		log.Fatalf("cannot open %v", fileName)
+	}
+	content, err := ioutil.ReadAll(file)
+	if err != nil {
+		log.Fatalf("cannot read %v", fileName)
+	}
+	file.Close()
+
+	kva := mapf(fileName, string(content))
+	bucket := make([][]KeyValue, nReduce)
+	for _, v := range kva {
+		inBucket := ihash(v.Key) % nReduce
+		bucket[inBucket] = append(bucket[inBucket], v)
+	}
+
+	for i := 0; i < nReduce; i++ {
+		tempFileName := mapFileName(mapIndex, i)
+		func(outputFileName string) {
+			f, err := os.OpenFile(outputFileName, os.O_RDWR|os.O_CREATE|os.O_TRUNC, 0755)
+			if err != nil {
+				log.Fatalf("cannot open %v", outputFileName)
+			}
+			defer f.Close()
+
+			outputJson, err := json.Marshal(kva[i])
+			if err != nil {
+				log.Fatalf("cannot parse json %v", outputFileName)
+			}
+
+			_, err = f.Write(outputJson)
+			if err != nil {
+				log.Fatalf("cannot write file to %v", outputFileName)
+			}
+		}(tempFileName)
+	}
+
+	callComplete(mapIndex, TaskTypeMap)
+}
+
+func Reduce(reducef ReduceFunction, nMap, reduceIndex int) {
+	outputFile := outputFileName(reduceIndex)
+	f, err := os.OpenFile(outputFile, os.O_RDWR|os.O_CREATE|os.O_TRUNC, 0755)
+	if err != nil {
+		log.Fatalf("cannot open %v", outputFile)
+	}
+	defer f.Close()
+
+	for i := 0; i < nMap; i++ {
+		tmpFile := mapFileName(i, reduceIndex)
+		func(fileName string) {
+			f, err := os.OpenFile(fileName, os.O_RDONLY, 0755)
+			if err != nil {
+				log.Fatalf("cannot open %v", fileName)
+			}
+			defer f.Close()
+			content, err := ioutil.ReadAll(f)
+			if err != nil {
+				log.Fatalf("cannot open %v", fileName)
+			}
+
+			data := make([]KeyValue, 0)
+			if err := json.Unmarshal(content, &data); err != nil {
+				log.Fatalf("cannot parse json %v", fileName)
+			}
+
+			kvMap := make(map[string][]string)
+			for _, val := range data {
+				kvMap[val.Key] = append(kvMap[val.Key], val.Value)
+			}
+
+			for k, v := range kvMap {
+				prod := reducef(k, v) // to be done
+				fmt.Fprintf(f, "%v %v\n", k, prod)
+			}
+		}(tmpFile)
+	}
+}
+
+func Worker(mapf MapFunction, reducef ReduceFunction) {
 	failTime := 0
 	for {
 		args := TaskRequestArgs{}
@@ -55,16 +134,12 @@ func Worker(mapf MapFunction,
 			case TaskTypeFinished:
 				{
 					fmt.Println("[Worker] Terminate after received finished request.")
-					os.Exit(0)
+					return
 				}
 			case TaskTypeMap:
-				{
-
-				}
+				Map(mapf, reply.Index, reply.Count, reply.FileName)
 			case TaskTypeReduce:
-				{
-
-				}
+				Reduce(reducef, reply.Count, reply.Index)
 			case TaskTypePending:
 				{
 					// do nothing
@@ -84,10 +159,10 @@ func Worker(mapf MapFunction,
 	}
 }
 
-func callComplete(data string, taskType int) {
+func callComplete(index int, taskType int) {
 	args := TaskCompleteArgs{
-		Type: taskType,
-		Data: data,
+		Type:  taskType,
+		Index: index,
 	}
 	reply := TaskCompleteReply{}
 	call("Master.HandleTaskComplete", &args, &reply)

@@ -19,19 +19,18 @@ const (
 )
 
 type TaskRequestArgs struct {
-
 }
 
 type TaskRequestReply struct {
-	Type  int
-	Data  string
-	Index int
+	Type     int
+	FileName string
+	Index    int
+	Count    int
 }
 
 type TaskCompleteArgs struct {
-	Type  int
-	Data  string
-	Index int
+	Type     int
+	Index    int
 }
 
 type TaskCompleteReply struct {

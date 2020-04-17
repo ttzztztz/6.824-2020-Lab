@@ -1,7 +1,6 @@
 package mr
 
 import (
-	"fmt"
 	"log"
 	"net"
 	"net/http"
@@ -12,13 +11,13 @@ import (
 )
 
 type CompleteChannelObject struct {
-	TaskType int
-	TaskData string
+	Type  int
+	Index int
 }
 
 type Master struct {
-	MapTasksStatus    map[string]int
-	ReduceTasksStatus map[string]int
+	MapTasksStatus    map[int]int
+	ReduceTasksStatus map[int]int
 
 	Files   []string
 	NReduce int
@@ -32,39 +31,49 @@ const TaskStatusStart = 0
 const TaskStatusDoing = 1
 const TaskStatusDone = 2
 
-func (m *Master) timeOutRemove(task string, taskType int) {
+func (m *Master) timeOutRemove(data map[int]int, index int) {
 	m.mutex.Lock()
 	defer m.mutex.Unlock()
 
-	if taskType == TaskTypeReduce {
-		m.ReduceTasksStatus[task] = TaskStatusStart
-	} else {
-		m.MapTasksStatus[task] = TaskStatusStart
-	}
+	data[index] = TaskStatusStart
 }
 
-func (m *Master) timeOutHandler(task string, taskType int) {
+func (m *Master) timeOutHandler(taskType, taskIndex int) {
 	for {
 		select {
 		case complete := <-m.CompleteChannel:
-			if complete.TaskType == taskType && complete.TaskData == task {
+			if complete.Type == taskType && complete.Index == taskIndex {
 				return
 			}
 		case <-time.After(10 * time.Second):
-			m.timeOutRemove(task, taskType)
+			if taskType == TaskTypeMap {
+				m.timeOutRemove(m.MapTasksStatus, taskIndex)
+			} else if taskType == TaskTypeReduce {
+				m.timeOutRemove(m.ReduceTasksStatus, taskIndex)
+			}
 			return
 		}
 	}
 }
 
-func (m *Master) unsafePickOneTask(list map[string]int) (bool, string) {
-	for k, v := range list {
+func (m *Master) unsafePickOneMapTask() (bool, string, int) {
+	for k, v := range m.MapTasksStatus {
+		if v == TaskStatusStart {
+			return true, m.Files[k], k
+		}
+	}
+
+	return false, "", 0
+}
+
+func (m *Master) unsafePickOneReduceTask() (bool, int) {
+	for k, v := range m.ReduceTasksStatus {
 		if v == TaskStatusStart {
 			return true, k
 		}
 	}
 
-	return false, ""
+	return false, 0
 }
 
 func (m *Master) HandleTaskRequest(_ *TaskRequestArgs, reply *TaskRequestReply) error {
@@ -73,24 +82,38 @@ func (m *Master) HandleTaskRequest(_ *TaskRequestArgs, reply *TaskRequestReply) 
 
 	if m.unsafeDone() {
 		reply.Type = TaskTypeFinished
-		reply.Data = ""
+		reply.FileName = ""
 		return nil
 	}
 
-	if success, data := m.unsafePickOneTask(m.MapTasksStatus); success {
+	if success, fileName, fileIndex := m.unsafePickOneMapTask(); success {
 		reply.Type = TaskTypeMap
-		reply.Data = data
+		reply.FileName = fileName
+		reply.Index = fileIndex
+		reply.Count = m.NReduce
+
+		go m.timeOutHandler(TaskTypeMap, reply.Index)
 		return nil
 	}
 
-	if success, data := m.unsafePickOneTask(m.ReduceTasksStatus); success {
+	if !m.unsafeMapDone() {
+		reply.Type = TaskTypePending
+		reply.FileName = ""
+
+		return nil
+	}
+
+	if success, fileIndex := m.unsafePickOneReduceTask(); success {
 		reply.Type = TaskTypeReduce
-		reply.Data = data
+		reply.Index = fileIndex
+		reply.Count = len(m.Files)
+
+		go m.timeOutHandler(TaskTypeReduce, reply.Index)
 		return nil
 	}
 
 	reply.Type = TaskTypePending
-	reply.Data = ""
+	reply.FileName = ""
 	return nil
 }
 
@@ -100,20 +123,20 @@ func (m *Master) HandleTaskComplete(args *TaskCompleteArgs, reply *TaskCompleteR
 
 	reply.Ack = 1
 	if args.Type == TaskTypeReduce {
-		if m.ReduceTasksStatus[args.Data] != TaskStatusDoing {
+		if m.ReduceTasksStatus[args.Index] != TaskStatusDoing {
 			return nil
 		}
-		m.ReduceTasksStatus[args.Data] = TaskStatusDone
+		m.ReduceTasksStatus[args.Index] = TaskStatusDone
 	} else if args.Type == TaskTypeMap {
-		if m.MapTasksStatus[args.Data] != TaskStatusDoing {
+		if m.MapTasksStatus[args.Index] != TaskStatusDoing {
 			return nil
 		}
-		m.MapTasksStatus[args.Data] = TaskStatusDone
+		m.MapTasksStatus[args.Index] = TaskStatusDone
 	}
 
 	m.CompleteChannel <- CompleteChannelObject{
-		TaskType: args.Type,
-		TaskData: args.Data,
+		Type:  args.Type,
+		Index: args.Index,
 	}
 
 	return nil
@@ -145,13 +168,17 @@ func (m *Master) Done() bool {
 	return m.unsafeDone()
 }
 
-func (m *Master) unsafeDone() bool {
+func (m *Master) unsafeMapDone() bool {
 	for _, v := range m.MapTasksStatus {
 		if v != TaskStatusDone {
 			return false
 		}
 	}
 
+	return true
+}
+
+func (m *Master) unsafeReduceDone() bool {
 	for _, v := range m.ReduceTasksStatus {
 		if v != TaskStatusDone {
 			return false
@@ -161,6 +188,10 @@ func (m *Master) unsafeDone() bool {
 	return true
 }
 
+func (m *Master) unsafeDone() bool {
+	return m.unsafeMapDone() && m.unsafeReduceDone()
+}
+
 //
 // create a Master.
 // main/mrmaster.go calls this function.
@@ -168,11 +199,20 @@ func (m *Master) unsafeDone() bool {
 //
 func MakeMaster(files []string, nReduce int) *Master {
 	m := Master{
-		Files:   files,
-		NReduce: nReduce,
+		MapTasksStatus:    make(map[int]int),
+		ReduceTasksStatus: make(map[int]int),
+		Files:             files,
+		NReduce:           nReduce,
+		CompleteChannel:   make(chan CompleteChannelObject),
+		mutex:             sync.Mutex{},
 	}
 
-	fmt.Println(files)
+	for k := range files {
+		m.MapTasksStatus[k] = TaskStatusStart
+	}
+	for i := 0; i < nReduce; i++ {
+		m.ReduceTasksStatus[i] = TaskStatusStart
+	}
 
 	m.server()
 	return &m
