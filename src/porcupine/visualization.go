@@ -397,8 +397,8 @@ html {
             const globalized = [] // linearization with global indexes instead of partition-local ones
             const included = new Set() // for figuring out illegal next LPs
             lin.forEach((id, position) => {
-              included.add(id['Index'])
-              const gid = partition['History'][id['Index']]['Gid']
+              included.add(id['CommandIndex'])
+              const gid = partition['History'][id['CommandIndex']]['Gid']
               globalized.push(gid)
               eventToLinearizations[gid].push({'index': lgid, 'position': position})
             })
@@ -588,7 +588,7 @@ html {
             let prevEl = null
             const included = new Set()
             lin.forEach(id => {
-              const el = partition['History'][id['Index']]
+              const el = partition['History'][id['CommandIndex']]
               const hereX = PADDING + XOFF + xPos[el['Start']]
               const x = prevX !== null ? Math.max(hereX, prevX + EPSILON) : hereX
               const y = PADDING + el['ClientId'] * (BOX_HEIGHT + BOX_SPACE) - LINE_BLEED
@@ -613,7 +613,7 @@ html {
               prevX = x
               prevY = y
               prevEl = el
-              included.add(id['Index'])
+              included.add(id['CommandIndex'])
             })
             // show possible but illegal next linearizations
             // a history element is a possible next try
@@ -734,7 +734,7 @@ html {
               for (let i = 0; i < lin.length; i++) {
                 prev = curr
                 curr = lin[i]
-                if (curr['Index'] === index) {
+                if (curr['CommandIndex'] === index) {
                   found = true
                   break
                 }
