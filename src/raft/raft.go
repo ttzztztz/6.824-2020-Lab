@@ -578,8 +578,8 @@ func (rf *Raft) run() {
 				rf.unsafeChangeRole(RoleFollower)
 				rf.mu.Unlock()
 			case <-rf.electWinCh:
-				DPrintf("[%d] Win the elect \n", rf.me)
 				rf.mu.Lock()
+				DPrintf("[%d] Win the elect, term = %d \n", rf.me, rf.term)
 				rf.unsafeChangeRole(RoleLeader)
 
 				rf.nextIndex = make([]int, len(rf.peers))
