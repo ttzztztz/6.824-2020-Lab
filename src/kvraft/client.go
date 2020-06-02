@@ -1,12 +1,18 @@
 package kvraft
 
-import "../labrpc"
-import "crypto/rand"
-import "math/big"
+import (
+	"crypto/rand"
+	"math/big"
+	"sync"
+	"time"
 
+	"../labrpc"
+)
 
 type Clerk struct {
-	servers []*labrpc.ClientEnd
+	servers  []*labrpc.ClientEnd
+	sequence int
+	mutex    sync.Mutex
 	// You will have to modify this struct.
 }
 
@@ -37,7 +43,24 @@ func MakeClerk(servers []*labrpc.ClientEnd) *Clerk {
 // arguments. and reply must be passed as a pointer.
 //
 func (ck *Clerk) Get(key string) string {
+	args, reply := &GetArgs{
+		Key: key,
+	}, &GetReply{}
 
+	for _, item := range ck.servers {
+		okChan := make(chan bool)
+		go func() {
+			okChan <- item.Call("KVServer.Get", &args, &reply)
+		}()
+
+		select {
+		case result := <-okChan:
+			if result {
+				return reply.Value
+			}
+		case <-time.After(300 * time.Millisecond):
+		}
+	}
 	// You will have to modify this function.
 	return ""
 }
@@ -53,7 +76,32 @@ func (ck *Clerk) Get(key string) string {
 // arguments. and reply must be passed as a pointer.
 //
 func (ck *Clerk) PutAppend(key string, value string, op string) {
-	// You will have to modify this function.
+	ck.mutex.Lock()
+	seq := ck.sequence
+	ck.sequence++
+	ck.mutex.Unlock()
+
+	args, reply := &PutAppendArgs{
+		Key:      key,
+		Value:    value,
+		Op:       op,
+		Sequence: seq,
+	}, &PutAppendReply{}
+
+	for _, item := range ck.servers {
+		okChan := make(chan bool)
+		go func() {
+			okChan <- item.Call("KVServer.PutAppend", &args, &reply)
+		}()
+
+		select {
+		case result := <-okChan:
+			if result {
+				return
+			}
+		case <-time.After(300 * time.Millisecond):
+		}
+	}
 }
 
 func (ck *Clerk) Put(key string, value string) {
