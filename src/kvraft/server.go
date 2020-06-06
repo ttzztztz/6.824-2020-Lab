@@ -20,9 +20,11 @@ func DPrintf(format string, a ...interface{}) (n int, err error) {
 }
 
 type Op struct {
-	// Your definitions here.
-	// Field names must start with capital letters,
-	// otherwise RPC will break.
+	Command string
+	Key     string
+	Value   string
+	Seq     int
+	Cid     int64
 }
 
 type KVServer struct {
@@ -35,14 +37,120 @@ type KVServer struct {
 	maxraftstate int // snapshot if log grows this big
 
 	// Your definitions here.
+	data      map[string]string
+	lastReply map[int64]*LastReply
+	notify    map[int]chan bool
 }
 
 func (kv *KVServer) Get(args *GetArgs, reply *GetReply) {
+	// A kvserver should not complete a Get() RPC if it is not part of
+	// a majority (so that it does not serve stale data).
+	// A simple solution is to enter every Get()
+	// (as well as each Put() and Append()) in the Raft log.
 
+	if _, isLeader := kv.rf.GetState(); !isLeader {
+		reply.Err = ErrWrongLeader
+		return
+	}
+
+	kv.mu.Lock()
+	if lastReply, ok := kv.lastReply[args.Cid]; ok && args.Seq <= lastReply.Seq {
+		reply.Err = lastReply.Err
+		reply.Value = lastReply.Value
+		kv.mu.Unlock()
+		return
+	}
+	kv.mu.Unlock()
+
+	cmd := Op{
+		Command: "Get",
+		Key:     args.Key,
+		Seq:     args.Seq,
+		Cid:     args.Cid,
+	}
+
+	index, startTerm, isLeader := kv.rf.Start(cmd)
+	if !isLeader {
+		reply.Err = ErrWrongLeader
+		return
+	}
+
+	kv.mu.Lock()
+	okChan := make(chan bool)
+	kv.notify[index] = okChan
+	kv.mu.Unlock()
+
+	select {
+	case <-okChan:
+		curTerm, isLeader := kv.rf.GetState()
+		if startTerm != curTerm || !isLeader {
+			reply.Err = ErrWrongLeader
+			return
+		}
+
+		if val, ok := kv.data[args.Key]; ok {
+			reply.Value = val
+			reply.Err = OK
+		} else {
+			reply.Err = ErrNoKey
+		}
+	}
 }
 
 func (kv *KVServer) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
-	// Your code here.
+	if _, isLeader := kv.rf.GetState(); !isLeader {
+		reply.Err = ErrWrongLeader
+		return
+	}
+
+	kv.mu.Lock()
+	if lastReply, ok := kv.lastReply[args.Cid]; ok && args.Seq <= lastReply.Seq {
+		reply.Err = lastReply.Err
+		kv.mu.Unlock()
+		return
+	}
+	kv.mu.Unlock()
+
+	cmd := Op{
+		Command: args.Op,
+		Key:     args.Key,
+		Seq:     args.Seq,
+		Cid:     args.Cid,
+		Value:   args.Value,
+	}
+
+	index, startTerm, isLeader := kv.rf.Start(cmd)
+	if !isLeader {
+		reply.Err = ErrWrongLeader
+		return
+	}
+
+	kv.mu.Lock()
+	okChan := make(chan bool)
+	kv.notify[index] = okChan
+	kv.mu.Unlock()
+
+	select {
+	case <-okChan:
+		curTerm, isLeader := kv.rf.GetState()
+		if startTerm != curTerm || !isLeader {
+			reply.Err = ErrWrongLeader
+			return
+		}
+
+		kv.mu.Lock()
+		if val, ok := kv.data[args.Key]; ok {
+			if args.Op == "Append" {
+				kv.data[args.Key] += val
+			} else {
+				kv.data[args.Key] = val
+			}
+		} else {
+			kv.data[args.Key] = val
+		}
+		kv.mu.Unlock()
+		reply.Err = OK
+	}
 }
 
 //
@@ -64,6 +172,61 @@ func (kv *KVServer) Kill() {
 func (kv *KVServer) killed() bool {
 	z := atomic.LoadInt32(&kv.dead)
 	return z == 1
+}
+
+func (kv *KVServer) applyDaemon() {
+	for ae := range kv.applyCh {
+		if command, ok := ae.Command.(Op); ok {
+			func() {
+				kv.mu.Lock()
+				defer kv.mu.Unlock()
+
+				if lastReply, ok := kv.lastReply[command.Cid]; !ok || command.Seq > lastReply.Seq {
+					switch command.Command {
+					case "Get":
+						lastReply := &LastReply{
+							Seq:   command.Seq,
+						}
+
+						kv.mu.Lock()
+						if val, ok := kv.data[command.Key]; ok {
+							lastReply.Value = val
+						} else {
+							lastReply.Err = ErrNoKey
+						}
+						kv.lastReply[command.Cid] = lastReply
+						kv.mu.Unlock()
+					case "Put":
+						lastReply := &LastReply{
+							Seq: command.Seq,
+						}
+
+						kv.mu.Lock()
+						kv.data[command.Key] = command.Value
+						kv.lastReply[command.Cid] = lastReply
+						kv.mu.Unlock()
+					case "Append":
+						lastReply := &LastReply{
+							Seq: command.Seq,
+						}
+
+						kv.mu.Lock()
+						kv.data[command.Key] += command.Value
+						kv.lastReply[command.Cid] = lastReply
+						kv.mu.Unlock()
+					}
+				}
+			}()
+
+			kv.mu.Lock()
+			if _, ok := kv.notify[ae.CommandIndex]; ok {
+				kv.notify[ae.CommandIndex] <- true
+				close(kv.notify[ae.CommandIndex])
+				delete(kv.notify, ae.CommandIndex)
+			}
+			kv.mu.Unlock()
+		}
+	}
 }
 
 //
@@ -92,9 +255,13 @@ func StartKVServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persiste
 	// You may need initialization code here.
 
 	kv.applyCh = make(chan raft.ApplyMsg)
+	kv.data = make(map[string]string)
+	kv.notify = make(map[int]chan bool)
+	kv.lastReply = make(map[int64]*LastReply)
+
 	kv.rf = raft.Make(servers, me, persister, kv.applyCh)
 
 	// You may need initialization code here.
-
+	go kv.applyDaemon()
 	return kv
 }

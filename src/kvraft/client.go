@@ -1,12 +1,11 @@
 package kvraft
 
 import (
+	"../labrpc"
 	"crypto/rand"
 	"math/big"
 	"sync"
 	"time"
-
-	"../labrpc"
 )
 
 type Clerk struct {
@@ -14,6 +13,9 @@ type Clerk struct {
 	sequence int
 	mutex    sync.Mutex
 	// You will have to modify this struct.
+
+	lastLeader int
+	Cid        int64
 }
 
 func nrand() int64 {
@@ -26,6 +28,8 @@ func nrand() int64 {
 func MakeClerk(servers []*labrpc.ClientEnd) *Clerk {
 	ck := new(Clerk)
 	ck.servers = servers
+
+	ck.Cid = nrand()
 	// You'll have to add code here.
 	return ck
 }
@@ -43,26 +47,46 @@ func MakeClerk(servers []*labrpc.ClientEnd) *Clerk {
 // arguments. and reply must be passed as a pointer.
 //
 func (ck *Clerk) Get(key string) string {
+	seq := ck.sequence
+	ck.sequence++
+
 	args, reply := &GetArgs{
 		Key: key,
+		Seq: seq,
+		Cid: ck.Cid,
 	}, &GetReply{}
 
-	for _, item := range ck.servers {
+	offset := -1
+	for {
+		offset++
+		curServer := (ck.lastLeader + offset) % len(ck.servers)
+
 		okChan := make(chan bool)
 		go func() {
-			okChan <- item.Call("KVServer.Get", &args, &reply)
+			ok := ck.servers[curServer].Call("KVServer.Get", args, reply)
+
+			okChan <- ok
+			close(okChan)
 		}()
 
 		select {
-		case result := <-okChan:
-			if result {
-				return reply.Value
+		case ok := <-okChan:
+			if ok {
+				if reply.Err == ErrWrongLeader {
+					ck.lastLeader = (ck.lastLeader + 1) % len(ck.servers)
+				} else if reply.Err == ErrNoKey {
+					ck.lastLeader = curServer
+					return ""
+				} else if reply.Err == OK {
+					ck.lastLeader = curServer
+					return reply.Value
+				}
 			}
-		case <-time.After(300 * time.Millisecond):
+			close(okChan)
+		case <-time.After(600 * time.Millisecond):
+			continue
 		}
 	}
-	// You will have to modify this function.
-	return ""
 }
 
 //
@@ -76,30 +100,42 @@ func (ck *Clerk) Get(key string) string {
 // arguments. and reply must be passed as a pointer.
 //
 func (ck *Clerk) PutAppend(key string, value string, op string) {
-	ck.mutex.Lock()
 	seq := ck.sequence
 	ck.sequence++
-	ck.mutex.Unlock()
 
 	args, reply := &PutAppendArgs{
-		Key:      key,
-		Value:    value,
-		Op:       op,
-		Sequence: seq,
+		Key:   key,
+		Value: value,
+		Op:    op,
+		Seq:   seq,
+		Cid:   ck.Cid,
 	}, &PutAppendReply{}
 
-	for _, item := range ck.servers {
+	offset := -1
+	for {
+		offset++
+		curServer := (ck.lastLeader + offset) % len(ck.servers)
+
 		okChan := make(chan bool)
 		go func() {
-			okChan <- item.Call("KVServer.PutAppend", &args, &reply)
+			ok := ck.servers[curServer].Call("KVServer.PutAppend", args, reply)
+
+			okChan <- ok
+			close(okChan)
 		}()
 
 		select {
-		case result := <-okChan:
-			if result {
-				return
+		case ok := <-okChan:
+			if ok {
+				if reply.Err == ErrWrongLeader {
+					ck.lastLeader = (ck.lastLeader + 1) % len(ck.servers)
+				} else if reply.Err == OK {
+					ck.lastLeader = curServer
+					return
+				}
 			}
-		case <-time.After(300 * time.Millisecond):
+		case <-time.After(600 * time.Millisecond):
+			continue
 		}
 	}
 }
