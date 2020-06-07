@@ -1,6 +1,8 @@
 package kvraft
 
 import (
+	"bytes"
+	"encoding/gob"
 	"log"
 	"sync"
 	"sync/atomic"
@@ -35,7 +37,8 @@ type KVServer struct {
 	applyCh chan raft.ApplyMsg
 	dead    int32 // set by Kill()
 
-	maxraftstate int // snapshot if log grows this big
+	maxraftstate     int // snapshot if log grows this big
+	lastCommandIndex int
 
 	// Your definitions here.
 	data      map[string]string
@@ -265,4 +268,45 @@ func StartKVServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persiste
 	// You may need initialization code here.
 	go kv.applyDaemon()
 	return kv
+}
+
+func (kv *KVServer) shouldTaskSnapshot() bool {
+	if kv.maxraftstate == -1 {
+		return false
+	}
+
+	return kv.rf.GetLogSize() >= kv.maxraftstate
+}
+
+func (kv *KVServer) unsafeSnapshotData() []byte {
+	w := new(bytes.Buffer)
+	e := gob.NewEncoder(w)
+
+	e.Encode(kv.lastCommandIndex)
+	e.Encode(kv.data)
+
+	return w.Bytes()
+}
+
+func (kv *KVServer) WriteSnapshot() {
+	kv.mu.Lock()
+	defer kv.mu.Unlock()
+
+	data := kv.unsafeSnapshotData()
+	kv.rf.PersistDataAndSnapshot(kv.lastCommandIndex, data)
+}
+
+func (kv *KVServer) ReadSnapshot() {
+	snapshot := kv.rf.ReadSnapshot()
+	if snapshot == nil || len(snapshot) == 0 {
+		return
+	}
+
+	r := bytes.NewBuffer(snapshot)
+	d := labgob.NewDecoder(r)
+
+	kv.mu.Lock()
+	defer kv.mu.Unlock()
+	d.Decode(&kv.lastCommandIndex)
+	d.Decode(&kv.data)
 }

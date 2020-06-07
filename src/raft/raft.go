@@ -84,6 +84,8 @@ type Raft struct {
 	lastApplied int
 	commitIndex int
 
+	lastIncludedIndex int
+
 	nextIndex  []int
 	matchIndex []int
 
@@ -96,6 +98,10 @@ type Raft struct {
 	voteFor int
 	log     []LogEntry
 	term    int
+}
+
+func (rf *Raft) GetLogSize() int {
+	return len(rf.log)
 }
 
 func (rf *Raft) unsafeGetLastLogIndex() int {
@@ -112,6 +118,16 @@ func (rf *Raft) GetState() (int, bool) {
 	return rf.term, rf.role == RoleLeader
 }
 
+func (rf *Raft) unsafePersistData() []byte {
+	w := new(bytes.Buffer)
+	e := gob.NewEncoder(w)
+	e.Encode(rf.term)
+	e.Encode(rf.voteFor)
+	e.Encode(rf.log)
+	e.Encode(rf.lastIncludedIndex)
+	return w.Bytes()
+}
+
 //
 // save Raft's persistent state to stable storage,
 // where it can later be retrieved after a crash and restart.
@@ -126,13 +142,10 @@ func (rf *Raft) persist() {
 	// e.Encode(rf.yyy)
 	// data := w.Bytes()
 	// rf.persister.SaveRaftState(data)
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
 
-	w := new(bytes.Buffer)
-	e := gob.NewEncoder(w)
-	e.Encode(rf.term)
-	e.Encode(rf.voteFor)
-	e.Encode(rf.log)
-	data := w.Bytes()
+	data := rf.unsafePersistData()
 	rf.persister.SaveRaftState(data)
 }
 
@@ -173,6 +186,7 @@ func (rf *Raft) readPersist(data []byte) {
 	d.Decode(&rf.term)
 	d.Decode(&rf.voteFor)
 	d.Decode(&rf.log)
+	d.Decode(&rf.lastIncludedIndex)
 }
 
 func (rf *Raft) generateElectionTimeout() time.Duration {
@@ -669,4 +683,102 @@ func (rf *Raft) isLogConflict(server []LogEntry, client []LogEntry) bool {
 		}
 	}
 	return false
+}
+
+func (rf *Raft) getNewLogId(i int) int {
+	return i - rf.lastIncludedIndex
+}
+
+func (rf *Raft) getLog(i int) LogEntry {
+	offset := rf.getNewLogId(i)
+	return rf.log[offset]
+}
+
+func (rf *Raft) PersistDataAndSnapshot(lastIncludedIndex int, snapshot []byte) {
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+
+	if lastIncludedIndex > rf.lastIncludedIndex {
+		threshold := rf.getNewLogId(lastIncludedIndex)
+		rf.log = rf.log[:threshold]
+
+		rf.lastIncludedIndex = lastIncludedIndex
+		data := rf.unsafePersistData()
+		rf.persister.SaveStateAndSnapshot(data, snapshot)
+	}
+}
+
+type InstallSnapshotArgs struct {
+	Term   int
+	Leader int
+
+	LastIncludedIndex int
+	LastIncludedTerm  int
+
+	Data []byte
+}
+
+type InstallSnapshotReply struct {
+	Term int
+}
+
+func (rf *Raft) InstallSnapshot(args *InstallSnapshotArgs, reply *InstallSnapshotReply) {
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+
+	reply.Term = rf.term
+	if args.Term < rf.term || args.LastIncludedIndex <= rf.lastIncludedIndex {
+		return
+	}
+
+	lastIncludedIndex := args.LastIncludedIndex
+	threshold := rf.getNewLogId(lastIncludedIndex)
+	rf.log = rf.log[:threshold]
+
+	rf.lastIncludedIndex = lastIncludedIndex
+	data := rf.unsafePersistData()
+	rf.persister.SaveStateAndSnapshot(data, args.Data)
+}
+
+func (rf *Raft) sendInstallSnapshotRPC(server int) bool {
+	rf.mu.Lock()
+	if _, isLeader := rf.GetState(); !isLeader {
+		rf.mu.Unlock()
+		return
+	}
+
+	args := &InstallSnapshotArgs{
+		Term:              rf.term,
+		Leader:            rf.me,
+		LastIncludedIndex: rf.lastIncludedIndex,
+		LastIncludedTerm:  rf.getLog(rf.lastIncludedIndex).Term,
+		Data:              nil,
+	}
+	rf.mu.Unlock()
+	reply := &InstallSnapshotReply{}
+
+	if ok := rf.peers[server].Call("Raft.InstallSnapshot", &args, &reply); ok {
+		rf.mu.Lock()
+		if reply.Term > rf.term {
+			rf.term = reply.Term
+			rf.voteFor = -1
+			rf.role = RoleCandidate
+		} else {
+			if rf.nextIndex[server] < rf.lastIncludedIndex + 1 {
+				rf.nextIndex[server] = rf.lastIncludedIndex + 1
+			}
+
+			if rf.matchIndex[server] < rf.lastIncludedIndex {
+				rf.matchIndex[server] = rf.lastIncludedIndex
+			}
+		}
+		rf.mu.Unlock()
+		return true
+	} else {
+		return false
+	}
+}
+
+func (rf *Raft) ReadSnapshot() []byte {
+	return rf.persister.ReadSnapshot()
 }
