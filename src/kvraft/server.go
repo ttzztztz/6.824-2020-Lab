@@ -11,7 +11,7 @@ import (
 	"../raft"
 )
 
-const Debug = 1
+const Debug = 0
 
 func DPrintf(format string, a ...interface{}) (n int, err error) {
 	if Debug > 0 {
@@ -77,12 +77,14 @@ func (kv *KVServer) Get(args *GetArgs, reply *GetReply) {
 	}
 
 	kv.mu.Lock()
-	okChan := make(chan bool)
+	okChan := make(chan bool, 1)
 	kv.notify[index] = okChan
 	kv.mu.Unlock()
 
 	select {
 	case <-okChan:
+		kv.mu.Lock()
+		defer kv.mu.Unlock()
 		curTerm, isLeader := kv.rf.GetState()
 		if startTerm != curTerm || !isLeader {
 			reply.Err = ErrWrongLeader
@@ -110,8 +112,11 @@ func (kv *KVServer) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 		return
 	}
 
+	DPrintf("Server [%d] Lock require \n", kv.me)
 	kv.mu.Lock()
+	DPrintf("Server [%d] Lock require OK \n", kv.me)
 	if lastReply, ok := kv.lastReply[args.Cid]; ok && args.Seq <= lastReply.Seq {
+		DPrintf("Server [%d] last reply %+v \n", kv.me, lastReply)
 		reply.Err = lastReply.Err
 		kv.mu.Unlock()
 		return
@@ -126,6 +131,7 @@ func (kv *KVServer) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 		Value:   args.Value,
 	}
 
+	DPrintf("Server [%d] cmd = %+v \n", kv.me, cmd)
 	index, startTerm, isLeader := kv.rf.Start(cmd)
 	if !isLeader {
 		reply.Err = ErrWrongLeader
@@ -177,46 +183,47 @@ func (kv *KVServer) killed() bool {
 func (kv *KVServer) applyDaemon() {
 	for ae := range kv.applyCh {
 		if command, ok := ae.Command.(Op); ok {
-			func() {
-				kv.mu.Lock()
-				defer kv.mu.Unlock()
-
-				DPrintf("Server [%d] Apply channel received \n", kv.me)
-				if lastReply, ok := kv.lastReply[command.Cid]; !ok || command.Seq > lastReply.Seq {
-					switch command.Command {
-					case "Get":
-						lastReply := &LastReply{
-							Seq: command.Seq,
-						}
-
-						if val, ok := kv.data[command.Key]; ok {
-							lastReply.Value = val
-						} else {
-							lastReply.Err = ErrNoKey
-						}
-						kv.lastReply[command.Cid] = lastReply
-					case "Put":
-						lastReply := &LastReply{
-							Seq: command.Seq,
-						}
-
-						kv.data[command.Key] = command.Value
-						kv.lastReply[command.Cid] = lastReply
-					case "Append":
-						lastReply := &LastReply{
-							Seq: command.Seq,
-						}
-
-						kv.data[command.Key] += command.Value
-						kv.lastReply[command.Cid] = lastReply
-					}
-				}
-			}()
-
 			kv.mu.Lock()
+
+			DPrintf("Server [%d] Apply channel received \n", kv.me)
+			if lastReply, ok := kv.lastReply[command.Cid]; !ok || command.Seq > lastReply.Seq {
+				switch command.Command {
+				case "Get":
+					lastReply := &LastReply{
+						Seq: command.Seq,
+						Err: OK,
+					}
+
+					if val, ok := kv.data[command.Key]; ok {
+						lastReply.Value = val
+					} else {
+						lastReply.Err = ErrNoKey
+					}
+					kv.lastReply[command.Cid] = lastReply
+				case "Put":
+					lastReply := &LastReply{
+						Seq: command.Seq,
+						Err: OK,
+					}
+
+					kv.data[command.Key] = command.Value
+					kv.lastReply[command.Cid] = lastReply
+				case "Append":
+					lastReply := &LastReply{
+						Seq: command.Seq,
+						Err: OK,
+					}
+
+					kv.data[command.Key] += command.Value
+					kv.lastReply[command.Cid] = lastReply
+				}
+			}
+
 			if _, ok := kv.notify[ae.CommandIndex]; ok {
-				kv.notify[ae.CommandIndex] <- true
-				close(kv.notify[ae.CommandIndex])
+				go func(channel chan bool) {
+					channel <- true
+					close(channel)
+				}(kv.notify[ae.CommandIndex])
 				delete(kv.notify, ae.CommandIndex)
 			}
 			kv.mu.Unlock()

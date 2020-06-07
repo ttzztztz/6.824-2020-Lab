@@ -5,7 +5,10 @@ import (
 	"crypto/rand"
 	"math/big"
 	"sync"
+	"time"
 )
+
+const WrongLeaderWait = 50 * time.Millisecond
 
 type Clerk struct {
 	servers  []*labrpc.ClientEnd
@@ -47,6 +50,7 @@ func MakeClerk(servers []*labrpc.ClientEnd) *Clerk {
 //
 func (ck *Clerk) Get(key string) string {
 	DPrintf("Clerk [%d] Get %s \n", ck.Cid, key)
+	defer DPrintf("Clerk [%d] finished Get %s \n", ck.Cid, key)
 	seq := ck.sequence
 	ck.sequence++
 
@@ -60,6 +64,7 @@ func (ck *Clerk) Get(key string) string {
 	for {
 		if ok := ck.servers[curServer].Call("KVServer.Get", args, reply); ok {
 			if reply.Err == ErrWrongLeader {
+				time.Sleep(WrongLeaderWait)
 				curServer = (curServer + 1) % len(ck.servers)
 			} else if reply.Err == ErrNoKey {
 				ck.lastLeader = curServer
@@ -70,6 +75,8 @@ func (ck *Clerk) Get(key string) string {
 			} else if reply.Err == ErrTimeout {
 				continue
 			}
+		} else {
+			curServer = (curServer + 1) % len(ck.servers)
 		}
 	}
 }
@@ -86,6 +93,7 @@ func (ck *Clerk) Get(key string) string {
 //
 func (ck *Clerk) PutAppend(key string, value string, op string) {
 	DPrintf("Clerk [%d] %s, %s = %s \n", ck.Cid, op, key, value)
+	defer DPrintf("Clerk [%d] Finished %s, %s = %s \n", ck.Cid, op, key, value)
 	seq := ck.sequence
 	ck.sequence++
 
@@ -99,8 +107,10 @@ func (ck *Clerk) PutAppend(key string, value string, op string) {
 
 	curServer := ck.lastLeader
 	for {
+		DPrintf("Clerk [%d] curServer = %d \n", ck.Cid, curServer)
 		if ok := ck.servers[curServer].Call("KVServer.PutAppend", args, reply); ok {
 			if reply.Err == ErrWrongLeader {
+				time.Sleep(WrongLeaderWait)
 				curServer = (curServer + 1) % len(ck.servers)
 			} else if reply.Err == OK {
 				ck.lastLeader = curServer
@@ -108,6 +118,8 @@ func (ck *Clerk) PutAppend(key string, value string, op string) {
 			} else if reply.Err == ErrTimeout {
 				continue
 			}
+		} else {
+			curServer = (curServer + 1) % len(ck.servers)
 		}
 	}
 }
