@@ -4,13 +4,14 @@ import (
 	"log"
 	"sync"
 	"sync/atomic"
+	"time"
 
 	"../labgob"
 	"../labrpc"
 	"../raft"
 )
 
-const Debug = 0
+const Debug = 1
 
 func DPrintf(format string, a ...interface{}) (n int, err error) {
 	if Debug > 0 {
@@ -94,11 +95,17 @@ func (kv *KVServer) Get(args *GetArgs, reply *GetReply) {
 		} else {
 			reply.Err = ErrNoKey
 		}
+	case <-time.After(WaitCmdTimeOut):
+		reply.Err = ErrTimeout
+		return
 	}
 }
 
 func (kv *KVServer) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
+	DPrintf("Server [%d] Put append \n", kv.me)
+
 	if _, isLeader := kv.rf.GetState(); !isLeader {
+		DPrintf("Server [%d] Wrong Leader \n", kv.me)
 		reply.Err = ErrWrongLeader
 		return
 	}
@@ -125,6 +132,7 @@ func (kv *KVServer) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 		return
 	}
 
+	DPrintf("Server [%d] Command Started index = %d, term = %d \n", kv.me, index, startTerm)
 	kv.mu.Lock()
 	okChan := make(chan bool)
 	kv.notify[index] = okChan
@@ -138,18 +146,10 @@ func (kv *KVServer) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 			return
 		}
 
-		kv.mu.Lock()
-		if val, ok := kv.data[args.Key]; ok {
-			if args.Op == "Append" {
-				kv.data[args.Key] += val
-			} else {
-				kv.data[args.Key] = val
-			}
-		} else {
-			kv.data[args.Key] = val
-		}
-		kv.mu.Unlock()
 		reply.Err = OK
+	case <-time.After(WaitCmdTimeOut):
+		reply.Err = ErrTimeout
+		return
 	}
 }
 
@@ -181,39 +181,34 @@ func (kv *KVServer) applyDaemon() {
 				kv.mu.Lock()
 				defer kv.mu.Unlock()
 
+				DPrintf("Server [%d] Apply channel received \n", kv.me)
 				if lastReply, ok := kv.lastReply[command.Cid]; !ok || command.Seq > lastReply.Seq {
 					switch command.Command {
 					case "Get":
 						lastReply := &LastReply{
-							Seq:   command.Seq,
+							Seq: command.Seq,
 						}
 
-						kv.mu.Lock()
 						if val, ok := kv.data[command.Key]; ok {
 							lastReply.Value = val
 						} else {
 							lastReply.Err = ErrNoKey
 						}
 						kv.lastReply[command.Cid] = lastReply
-						kv.mu.Unlock()
 					case "Put":
 						lastReply := &LastReply{
 							Seq: command.Seq,
 						}
 
-						kv.mu.Lock()
 						kv.data[command.Key] = command.Value
 						kv.lastReply[command.Cid] = lastReply
-						kv.mu.Unlock()
 					case "Append":
 						lastReply := &LastReply{
 							Seq: command.Seq,
 						}
 
-						kv.mu.Lock()
 						kv.data[command.Key] += command.Value
 						kv.lastReply[command.Cid] = lastReply
-						kv.mu.Unlock()
 					}
 				}
 			}()
@@ -260,7 +255,6 @@ func StartKVServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persiste
 	kv.lastReply = make(map[int64]*LastReply)
 
 	kv.rf = raft.Make(servers, me, persister, kv.applyCh)
-
 	// You may need initialization code here.
 	go kv.applyDaemon()
 	return kv

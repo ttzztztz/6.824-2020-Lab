@@ -1,10 +1,15 @@
 package kvraft
 
+import "time"
+
 const (
 	OK             = "OK"
 	ErrNoKey       = "ErrNoKey"
 	ErrWrongLeader = "ErrWrongLeader"
+	ErrTimeout     = "ErrTimeout"
 )
+
+const WaitCmdTimeOut = time.Millisecond * 500
 
 type Err string
 

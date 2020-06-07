@@ -5,7 +5,6 @@ import (
 	"crypto/rand"
 	"math/big"
 	"sync"
-	"time"
 )
 
 type Clerk struct {
@@ -47,6 +46,7 @@ func MakeClerk(servers []*labrpc.ClientEnd) *Clerk {
 // arguments. and reply must be passed as a pointer.
 //
 func (ck *Clerk) Get(key string) string {
+	DPrintf("Clerk [%d] Get %s \n", ck.Cid, key)
 	seq := ck.sequence
 	ck.sequence++
 
@@ -56,35 +56,20 @@ func (ck *Clerk) Get(key string) string {
 		Cid: ck.Cid,
 	}, &GetReply{}
 
-	offset := -1
+	curServer := ck.lastLeader
 	for {
-		offset++
-		curServer := (ck.lastLeader + offset) % len(ck.servers)
-
-		okChan := make(chan bool)
-		go func() {
-			ok := ck.servers[curServer].Call("KVServer.Get", args, reply)
-
-			okChan <- ok
-			close(okChan)
-		}()
-
-		select {
-		case ok := <-okChan:
-			if ok {
-				if reply.Err == ErrWrongLeader {
-					ck.lastLeader = (ck.lastLeader + 1) % len(ck.servers)
-				} else if reply.Err == ErrNoKey {
-					ck.lastLeader = curServer
-					return ""
-				} else if reply.Err == OK {
-					ck.lastLeader = curServer
-					return reply.Value
-				}
+		if ok := ck.servers[curServer].Call("KVServer.Get", args, reply); ok {
+			if reply.Err == ErrWrongLeader {
+				curServer = (curServer + 1) % len(ck.servers)
+			} else if reply.Err == ErrNoKey {
+				ck.lastLeader = curServer
+				return ""
+			} else if reply.Err == OK {
+				ck.lastLeader = curServer
+				return reply.Value
+			} else if reply.Err == ErrTimeout {
+				continue
 			}
-			close(okChan)
-		case <-time.After(600 * time.Millisecond):
-			continue
 		}
 	}
 }
@@ -100,6 +85,7 @@ func (ck *Clerk) Get(key string) string {
 // arguments. and reply must be passed as a pointer.
 //
 func (ck *Clerk) PutAppend(key string, value string, op string) {
+	DPrintf("Clerk [%d] %s, %s = %s \n", ck.Cid, op, key, value)
 	seq := ck.sequence
 	ck.sequence++
 
@@ -111,31 +97,17 @@ func (ck *Clerk) PutAppend(key string, value string, op string) {
 		Cid:   ck.Cid,
 	}, &PutAppendReply{}
 
-	offset := -1
+	curServer := ck.lastLeader
 	for {
-		offset++
-		curServer := (ck.lastLeader + offset) % len(ck.servers)
-
-		okChan := make(chan bool)
-		go func() {
-			ok := ck.servers[curServer].Call("KVServer.PutAppend", args, reply)
-
-			okChan <- ok
-			close(okChan)
-		}()
-
-		select {
-		case ok := <-okChan:
-			if ok {
-				if reply.Err == ErrWrongLeader {
-					ck.lastLeader = (ck.lastLeader + 1) % len(ck.servers)
-				} else if reply.Err == OK {
-					ck.lastLeader = curServer
-					return
-				}
+		if ok := ck.servers[curServer].Call("KVServer.PutAppend", args, reply); ok {
+			if reply.Err == ErrWrongLeader {
+				curServer = (curServer + 1) % len(ck.servers)
+			} else if reply.Err == OK {
+				ck.lastLeader = curServer
+				return
+			} else if reply.Err == ErrTimeout {
+				continue
 			}
-		case <-time.After(600 * time.Millisecond):
-			continue
 		}
 	}
 }
