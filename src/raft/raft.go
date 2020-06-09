@@ -105,7 +105,7 @@ func (rf *Raft) GetLogSize() int {
 }
 
 func (rf *Raft) unsafeGetLastLogIndex() int {
-	return len(rf.log) - 1
+	return rf.lastIncludedIndex + len(rf.log) - 1
 }
 
 func (rf *Raft) unsafeGetLastLogTerm() int {
@@ -253,19 +253,19 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		return
 	}
 
-	if args.PreviousLogIndex > 0 && rf.log[args.PreviousLogIndex].Term != args.PreviousLogTerm {
-		logTerm := rf.log[args.PreviousLogIndex].Term
+	if args.PreviousLogIndex > 0 && rf.getLog(args.PreviousLogIndex).Term != args.PreviousLogTerm {
+		logTerm := rf.getLog(args.PreviousLogIndex).Term
 		for i := args.PreviousLogIndex - 1; i > 0; i-- {
-			if rf.log[i].Term != logTerm {
+			if rf.getLog(i).Term != logTerm {
 				reply.NextTryIndex = i + 1
 				break
 			}
 		}
 
 		DPrintf("[%d] previous log conflict, argTerm = %d, currentTerm = %d, currentIndex = %d, heartbeatIndex = %d, nextTry = %d \n",
-			rf.me, args.Term, rf.log[args.PreviousLogIndex].Term, rf.unsafeGetLastLogIndex(), args.PreviousLogIndex, reply.NextTryIndex)
+			rf.me, args.Term, rf.getLog(args.PreviousLogIndex).Term, rf.unsafeGetLastLogIndex(), args.PreviousLogIndex, reply.NextTryIndex)
 	} else {
-		newLog := rf.log[:args.PreviousLogIndex+1]
+		newLog := rf.log[:rf.getNewLogId(args.PreviousLogIndex+1)]
 		rf.log = append(newLog, args.Entries...)
 
 		reply.Ack = true
@@ -302,7 +302,7 @@ func (rf *Raft) sendAllAppendEntries() {
 			}
 
 			if rf.nextIndex[i] <= rf.unsafeGetLastLogIndex() {
-				args.Entries = rf.log[rf.nextIndex[i]:]
+				args.Entries = rf.log[rf.getNewLogId(rf.nextIndex[i]):]
 			}
 
 			go rf.sendAppendEntries(i, args, &AppendEntriesReply{})
@@ -493,7 +493,7 @@ func (rf *Raft) sendAppendEntries(server int, args *AppendEntriesArgs, reply *Ap
 		cnt := 1
 
 		for peerId := range rf.peers {
-			if peerId != rf.me && rf.matchIndex[peerId] >= i && rf.log[i].Term == rf.term {
+			if peerId != rf.me && rf.matchIndex[peerId] >= i && rf.getLog(i).Term == rf.term {
 				cnt++
 			}
 		}
