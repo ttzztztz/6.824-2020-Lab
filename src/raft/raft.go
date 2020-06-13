@@ -104,6 +104,10 @@ func (rf *Raft) GetLogSize() int {
 	return len(rf.log)
 }
 
+func (rf *Raft) GetRaftStateSize() int {
+	return rf.persister.RaftStateSize()
+}
+
 func (rf *Raft) unsafeGetLastLogIndex() int {
 	return rf.lastIncludedIndex + len(rf.log) - 1
 }
@@ -297,15 +301,19 @@ func (rf *Raft) sendAllAppendEntries() {
 				LeaderCommit:     rf.commitIndex,
 			}
 
-			if args.PreviousLogIndex >= 0 {
-				args.PreviousLogTerm = rf.unsafeGetLastLogTerm()
-			}
+			if args.PreviousLogIndex < rf.lastIncludedIndex {
+				go rf.sendInstallSnapshotRPC(i)
+			} else {
+				if args.PreviousLogIndex >= 0 {
+					args.PreviousLogTerm = rf.unsafeGetLastLogTerm()
+				}
 
-			if rf.nextIndex[i] <= rf.unsafeGetLastLogIndex() {
-				args.Entries = rf.log[rf.getNewLogId(rf.nextIndex[i]):]
-			}
+				if rf.nextIndex[i] <= rf.unsafeGetLastLogIndex() {
+					args.Entries = rf.log[rf.getNewLogId(rf.nextIndex[i]):]
+				}
 
-			go rf.sendAppendEntries(i, args, &AppendEntriesReply{})
+				go rf.sendAppendEntries(i, args, &AppendEntriesReply{})
+			}
 		}
 	}
 }
@@ -606,6 +614,7 @@ func (rf *Raft) run() {
 
 				rf.mu.Unlock()
 			case <-time.After(rf.generateElectionTimeout()):
+				DPrintf("Time after \n")
 			}
 		}
 	}
@@ -733,7 +742,15 @@ func (rf *Raft) InstallSnapshot(args *InstallSnapshotArgs, reply *InstallSnapsho
 
 	lastIncludedIndex := args.LastIncludedIndex
 	threshold := rf.getNewLogId(lastIncludedIndex)
+	DPrintf("[Install Snapshot] Threshold = %d \n", threshold)
+
 	rf.log = rf.log[:threshold]
+	//if len(rf.log) == 0 {
+	//	rf.log = append(rf.log, LogEntry{
+	//		Term: reply.Term,
+	//		Data: nil,
+	//	})
+	//}
 
 	rf.lastIncludedIndex = lastIncludedIndex
 	data := rf.unsafePersistData()
@@ -744,7 +761,7 @@ func (rf *Raft) sendInstallSnapshotRPC(server int) bool {
 	rf.mu.Lock()
 	if _, isLeader := rf.GetState(); !isLeader {
 		rf.mu.Unlock()
-		return
+		return false
 	}
 
 	args := &InstallSnapshotArgs{

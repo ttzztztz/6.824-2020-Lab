@@ -220,6 +220,10 @@ func (kv *KVServer) applyDaemon() {
 					kv.data[command.Key] += command.Value
 					kv.lastReply[command.Cid] = lastReply
 				}
+
+				if kv.shouldTaskSnapshot() {
+					kv.WriteSnapshot()
+				}
 			}
 
 			if _, ok := kv.notify[ae.CommandIndex]; ok {
