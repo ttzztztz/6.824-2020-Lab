@@ -13,7 +13,7 @@ import (
 	"../raft"
 )
 
-const Debug = 0
+const Debug = 1
 
 func DPrintf(format string, a ...interface{}) (n int, err error) {
 	if Debug > 0 {
@@ -115,9 +115,7 @@ func (kv *KVServer) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 		return
 	}
 
-	DPrintf("Server [%d] Lock require \n", kv.me)
 	kv.mu.Lock()
-	DPrintf("Server [%d] Lock require OK \n", kv.me)
 	if lastReply, ok := kv.lastReply[args.Cid]; ok && args.Seq <= lastReply.Seq {
 		DPrintf("Server [%d] last reply %+v \n", kv.me, lastReply)
 		reply.Err = lastReply.Err
@@ -136,12 +134,13 @@ func (kv *KVServer) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 
 	DPrintf("Server [%d] cmd = %+v \n", kv.me, cmd)
 	index, startTerm, isLeader := kv.rf.Start(cmd)
+	DPrintf("Server [%d] raft start index=%d, startTerm=%d, isLeader=%+v \n", kv.me,
+		index, startTerm, isLeader)
 	if !isLeader {
 		reply.Err = ErrWrongLeader
 		return
 	}
 
-	DPrintf("Server [%d] Command Started index = %d, term = %d \n", kv.me, index, startTerm)
 	kv.mu.Lock()
 	okChan := make(chan bool)
 	kv.notify[index] = okChan
