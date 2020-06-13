@@ -116,6 +116,7 @@ func (ck *Clerk) PutAppend(key string, value string, op string) {
 				ck.lastLeader = curServer
 				return
 			} else if reply.Err == ErrTimeout {
+				DPrintf("Clerk [%d] curServer = %d timeout \n", ck.Cid, curServer)
 				continue
 			}
 		} else {

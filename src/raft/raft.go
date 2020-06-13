@@ -138,6 +138,8 @@ func (rf *Raft) unsafePersistData() []byte {
 // see paper's Figure 2 for a description of what should be persistent.
 //
 func (rf *Raft) persist() {
+	// [WARNING] this is not a thread safe function! lock rf instance before usage
+
 	// Your code here (2C).
 	// Example:
 	// w := new(bytes.Buffer)
@@ -146,9 +148,6 @@ func (rf *Raft) persist() {
 	// e.Encode(rf.yyy)
 	// data := w.Bytes()
 	// rf.persister.SaveRaftState(data)
-	rf.mu.Lock()
-	defer rf.mu.Unlock()
-
 	data := rf.unsafePersistData()
 	rf.persister.SaveRaftState(data)
 }
@@ -228,7 +227,6 @@ type AppendEntriesReply struct {
 
 func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply) {
 	rf.mu.Lock()
-
 	defer rf.mu.Unlock()
 	defer rf.persist()
 
@@ -249,6 +247,11 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 
 	reply.Term = rf.term
 
+	if args.PreviousLogIndex < rf.lastIncludedIndex {
+		reply.NextTryIndex = rf.lastIncludedIndex + 1
+		return
+	}
+
 	if args.PreviousLogIndex > rf.unsafeGetLastLogIndex() {
 		DPrintf("[%d] previous log too high, current = %d, heartbeat = %d \n",
 			rf.me, rf.unsafeGetLastLogIndex(), args.PreviousLogIndex)
@@ -259,12 +262,11 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 
 	if args.PreviousLogIndex > 0 && rf.getLog(args.PreviousLogIndex).Term != args.PreviousLogTerm {
 		logTerm := rf.getLog(args.PreviousLogIndex).Term
-		for i := args.PreviousLogIndex - 1; i > 0; i-- {
-			if rf.getLog(i).Term != logTerm {
-				reply.NextTryIndex = i + 1
-				break
-			}
+		i := args.PreviousLogIndex - 1
+		for i > rf.lastIncludedIndex &&  i > rf.commitIndex && rf.getLog(i).Term == logTerm {
+			i--
 		}
+		reply.NextTryIndex = i + 1
 
 		DPrintf("[%d] previous log conflict, argTerm = %d, currentTerm = %d, currentIndex = %d, heartbeatIndex = %d, nextTry = %d \n",
 			rf.me, args.Term, rf.getLog(args.PreviousLogIndex).Term, rf.unsafeGetLastLogIndex(), args.PreviousLogIndex, reply.NextTryIndex)
@@ -437,6 +439,7 @@ func (rf *Raft) sendRequestVote(server int, args *RequestVoteArgs, reply *Reques
 	ok := rf.peers[server].Call("Raft.RequestVote", args, reply)
 
 	if !ok {
+		DPrintf("[%d] FAILED sent request vote rpc to server %d \n", rf.me, server)
 		return ok
 	}
 
@@ -457,6 +460,7 @@ func (rf *Raft) sendRequestVote(server int, args *RequestVoteArgs, reply *Reques
 	}
 
 	if reply.Granted {
+		DPrintf("[%d] Granted vote from %d \n", rf.me, server)
 		rf.voteCount++
 		if rf.voteCount > len(rf.peers)/2 {
 			DPrintf("[%d] Vote success, now leader \n", rf.me)
@@ -597,6 +601,7 @@ func (rf *Raft) run() {
 			select {
 			case <-rf.heartbeatCh:
 				rf.mu.Lock()
+				DPrintf("[%d] received heartbeat signal \n", rf.me)
 				rf.unsafeChangeRole(RoleFollower)
 				rf.mu.Unlock()
 			case <-rf.electWinCh:
@@ -667,14 +672,32 @@ func (rf *Raft) commit() {
 	defer rf.mu.Unlock()
 
 	DPrintf("[%d] Committing logs Start \n", rf.me)
-	for i := rf.lastApplied + 1; i <= rf.commitIndex; i++ {
-		rf.applyCh <- ApplyMsg{
-			Command:      rf.log[i].Data,
-			CommandIndex: i,
-			CommandValid: true,
-		}
+	var messages []ApplyMsg
 
-		rf.lastApplied = i
+	if rf.lastApplied < rf.lastIncludedIndex {
+		messages = []ApplyMsg{
+			{
+				CommandValid: false,
+				Command:      "Install Snapshot",
+				CommandIndex: rf.lastIncludedIndex,
+			},
+		}
+	} else if rf.commitIndex <= rf.lastApplied {
+		messages = []ApplyMsg{}
+	} else {
+		for i := rf.lastApplied + 1; i <= rf.commitIndex; i++ {
+			msg := ApplyMsg{
+				Command:      rf.getLog(i).Data,
+				CommandIndex: i,
+				CommandValid: true,
+			}
+			messages = append(messages, msg)
+		}
+	}
+
+	for _, msg := range messages {
+		rf.applyCh <- msg
+		rf.lastApplied = msg.CommandIndex
 	}
 
 	DPrintf("[%d] Committing logs End, lastApplied = %d, commitIndex = %d \n",
@@ -709,7 +732,9 @@ func (rf *Raft) PersistDataAndSnapshot(lastIncludedIndex int, snapshot []byte) {
 
 	if lastIncludedIndex > rf.lastIncludedIndex {
 		threshold := rf.getNewLogId(lastIncludedIndex)
-		rf.log = rf.log[:threshold]
+		rf.log = rf.log[threshold:]
+
+		DPrintf("[%d] persist data and snapshot threshold=%d \n", rf.me, threshold)
 
 		rf.lastIncludedIndex = lastIncludedIndex
 		data := rf.unsafePersistData()
@@ -744,7 +769,16 @@ func (rf *Raft) InstallSnapshot(args *InstallSnapshotArgs, reply *InstallSnapsho
 	threshold := rf.getNewLogId(lastIncludedIndex)
 	DPrintf("[Install Snapshot] Threshold = %d \n", threshold)
 
-	rf.log = rf.log[:threshold]
+	if threshold > len(rf.log) {
+		rf.log = []LogEntry{
+			{
+				Term: args.LastIncludedTerm,
+				Data: nil,
+			},
+		}
+	} else {
+		rf.log = rf.log[threshold:]
+	}
 	//if len(rf.log) == 0 {
 	//	rf.log = append(rf.log, LogEntry{
 	//		Term: reply.Term,
@@ -774,12 +808,14 @@ func (rf *Raft) sendInstallSnapshotRPC(server int) bool {
 	rf.mu.Unlock()
 	reply := &InstallSnapshotReply{}
 
-	if ok := rf.peers[server].Call("Raft.InstallSnapshot", &args, &reply); ok {
+	DPrintf("Send install snapshot request to server %d \n", server)
+	if ok := rf.peers[server].Call("Raft.InstallSnapshot", args, reply); ok {
+		DPrintf("[%d] reply is %+v \n", rf.me, *reply)
 		rf.mu.Lock()
 		if reply.Term > rf.term {
-			rf.term = reply.Term
-			rf.voteFor = -1
-			rf.role = RoleCandidate
+			//rf.term = reply.Term
+			//rf.voteFor = -1
+			//rf.role = RoleCandidate
 		} else {
 			if rf.nextIndex[server] < rf.lastIncludedIndex + 1 {
 				rf.nextIndex[server] = rf.lastIncludedIndex + 1

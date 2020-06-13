@@ -40,6 +40,8 @@ type KVServer struct {
 	maxraftstate     int // snapshot if log grows this big
 	lastCommandIndex int
 
+	persister *raft.Persister
+
 	// Your definitions here.
 	data      map[string]string
 	lastReply map[int64]*LastReply
@@ -184,10 +186,13 @@ func (kv *KVServer) killed() bool {
 
 func (kv *KVServer) applyDaemon() {
 	for ae := range kv.applyCh {
-		if command, ok := ae.Command.(Op); ok {
+		if !ae.CommandValid {
+			kv.ReadSnapshot()
+		}
+		if command, ok := ae.Command.(Op); ae.CommandValid && ok {
 			kv.mu.Lock()
 
-			DPrintf("Server [%d] Apply channel received \n", kv.me)
+			DPrintf("Server [%d] Apply channel received %+v \n", kv.me, Op{})
 			if lastReply, ok := kv.lastReply[command.Cid]; !ok || command.Seq > lastReply.Seq {
 				switch command.Command {
 				case "Get":
@@ -219,12 +224,11 @@ func (kv *KVServer) applyDaemon() {
 					kv.data[command.Key] += command.Value
 					kv.lastReply[command.Cid] = lastReply
 				}
-
-				if kv.shouldTaskSnapshot() {
-					kv.WriteSnapshot()
-				}
 			}
 
+			if kv.shouldTaskSnapshot() {
+				kv.unsafeWriteSnapshot(ae.CommandIndex)
+			}
 			if _, ok := kv.notify[ae.CommandIndex]; ok {
 				go func(channel chan bool) {
 					channel <- true
@@ -259,6 +263,7 @@ func StartKVServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persiste
 	kv := new(KVServer)
 	kv.me = me
 	kv.maxraftstate = maxraftstate
+	kv.persister = persister
 
 	// You may need initialization code here.
 
@@ -274,11 +279,13 @@ func StartKVServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persiste
 }
 
 func (kv *KVServer) shouldTaskSnapshot() bool {
+	DPrintf("[%d] Should take snapshot? max=%d, cur=%d \n", kv.me,
+		kv.maxraftstate, kv.persister.RaftStateSize())
 	if kv.maxraftstate == -1 {
 		return false
 	}
 
-	return kv.rf.GetLogSize() >= kv.maxraftstate
+	return kv.persister.RaftStateSize() >= kv.maxraftstate
 }
 
 func (kv *KVServer) unsafeSnapshotData() []byte {
@@ -291,12 +298,10 @@ func (kv *KVServer) unsafeSnapshotData() []byte {
 	return w.Bytes()
 }
 
-func (kv *KVServer) WriteSnapshot() {
-	kv.mu.Lock()
-	defer kv.mu.Unlock()
-
+func (kv *KVServer) unsafeWriteSnapshot(commandIndex int) {
+	DPrintf("[%d] writing snapshots...", kv.me)
 	data := kv.unsafeSnapshotData()
-	kv.rf.PersistDataAndSnapshot(kv.lastCommandIndex, data)
+	kv.rf.PersistDataAndSnapshot(commandIndex, data)
 }
 
 func (kv *KVServer) ReadSnapshot() {
