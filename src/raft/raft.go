@@ -262,11 +262,13 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 
 	if args.PreviousLogIndex > 0 && rf.getLog(args.PreviousLogIndex).Term != args.PreviousLogTerm {
 		logTerm := rf.getLog(args.PreviousLogIndex).Term
-		i := args.PreviousLogIndex - 1
-		for i > rf.lastIncludedIndex &&  i > rf.commitIndex && rf.getLog(i).Term == logTerm {
-			i--
+
+		for i := args.PreviousLogIndex - 1; i > rf.lastIncludedIndex && i >= 0; i-- {
+			if rf.getLog(i).Term != logTerm {
+				reply.NextTryIndex = i + 1
+				break
+			}
 		}
-		reply.NextTryIndex = i + 1
 
 		DPrintf("[%d] previous log conflict, argTerm = %d, currentTerm = %d, currentIndex = %d, heartbeatIndex = %d, nextTry = %d \n",
 			rf.me, args.Term, rf.getLog(args.PreviousLogIndex).Term, rf.unsafeGetLastLogIndex(), args.PreviousLogIndex, reply.NextTryIndex)
@@ -817,7 +819,7 @@ func (rf *Raft) sendInstallSnapshotRPC(server int) bool {
 			//rf.voteFor = -1
 			//rf.role = RoleCandidate
 		} else {
-			if rf.nextIndex[server] < rf.lastIncludedIndex + 1 {
+			if rf.nextIndex[server] < rf.lastIncludedIndex+1 {
 				rf.nextIndex[server] = rf.lastIncludedIndex + 1
 			}
 
